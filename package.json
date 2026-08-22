@@ -1,12 +1,12 @@
 {
   "name": "read-receipt-tracker",
   "version": "1.0.0",
-  "description": "消息已读追踪服务 - Vercel + Turso",
+  "description": "消息已读追踪服务 - Vercel + Neon",
   "scripts": {
     "dev": "node api/index.js"
   },
   "dependencies": {
-    "@libsql/client": "^0.6.0",
+    "pg": "^8.12.0",
     "express": "^4.18.2"
   },
   "engines": {
