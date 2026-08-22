@@ -1,64 +1,70 @@
 /**
- * read-receipt-tracker — Vercel + Turso 版
- * 功能与原版完全对齐，数据库换成 Turso (libsql)
+ * read-receipt-tracker — Vercel + Neon (PostgreSQL) 版
  */
 
 const express = require('express');
 const crypto = require('crypto');
-const path = require('path');
 
 // ==================== 数据库 ====================
-let db = null;
+let pool = null;
 
 async function getDb() {
-  if (db) return db;
+  if (pool) return pool;
 
-  const { createClient } = require('@libsql/client');
+  const { Pool } = require('pg');
 
-  const url = process.env.TURSO_DB_URL;
-  const authToken = process.env.TURSO_DB_AUTH_TOKEN;
-
-  if (!url) {
-    throw new Error('TURSO_DB_URL 环境变量未设置');
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('DATABASE_URL 环境变量未设置');
   }
 
-  db = createClient({ url, authToken });
+  pool = new Pool({
+    connectionString,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+  });
 
   // 初始化表
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id              TEXT PRIMARY KEY,
-      wx_id           TEXT NOT NULL,
-      content         TEXT DEFAULT '',
-      create_time     INTEGER NOT NULL,
-      registered_at   INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER))
-    )
-  `);
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id              TEXT PRIMARY KEY,
+        wx_id           TEXT NOT NULL,
+        content         TEXT DEFAULT '',
+        create_time     BIGINT NOT NULL,
+        registered_at   INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+      )
+    `);
 
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS reads (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      msg_id          TEXT NOT NULL,
-      wx_id           TEXT NOT NULL,
-      ip_address      TEXT,
-      user_agent      TEXT,
-      country         TEXT DEFAULT '',
-      region          TEXT DEFAULT '',
-      city            TEXT DEFAULT '',
-      isp             TEXT DEFAULT '',
-      loc             TEXT DEFAULT '',
-      reader_wx_id    TEXT DEFAULT '',
-      read_at         INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
-      UNIQUE(msg_id, ip_address)
-    )
-  `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reads (
+        id              SERIAL PRIMARY KEY,
+        msg_id          TEXT NOT NULL,
+        wx_id           TEXT NOT NULL,
+        ip_address      TEXT,
+        user_agent      TEXT,
+        country         TEXT DEFAULT '',
+        region          TEXT DEFAULT '',
+        city            TEXT DEFAULT '',
+        isp             TEXT DEFAULT '',
+        loc             TEXT DEFAULT '',
+        reader_wx_id    TEXT DEFAULT '',
+        read_at         INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
+        UNIQUE(msg_id, ip_address)
+      )
+    `);
 
-  // 索引
-  try { await db.execute(`CREATE INDEX IF NOT EXISTS idx_reads_msg ON reads(msg_id)`); } catch(e) {}
-  try { await db.execute(`CREATE INDEX IF NOT EXISTS idx_reads_wx ON reads(wx_id)`); } catch(e) {}
-  try { await db.execute(`CREATE INDEX IF NOT EXISTS idx_msgs_wx ON messages(wx_id)`); } catch(e) {}
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reads_msg ON reads(msg_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reads_wx ON reads(wx_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_msgs_wx ON messages(wx_id)`);
+  } finally {
+    client.release();
+  }
 
-  return db;
+  return pool;
 }
 
 // ==================== 配置 ====================
@@ -122,7 +128,6 @@ async function lookupIpLocation(ip) {
   if (!ENABLE_GEO) return null;
   if (!ip || ip === '0.0.0.0' || ip === '127.0.0.1' || ip === '::1') return null;
 
-  // 接口 1: ip-api.com
   try {
     const d = await fetchJson(`http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,country,regionName,city,isp,lat,lon`);
     if (d.status === 'success') {
@@ -133,7 +138,6 @@ async function lookupIpLocation(ip) {
     }
   } catch(e) {}
 
-  // 接口 2: ipwho.is
   try {
     const d = await fetchJson(`https://ipwho.is/${ip}?lang=zh-CN`);
     if (d.success) {
@@ -145,7 +149,6 @@ async function lookupIpLocation(ip) {
     }
   } catch(e) {}
 
-  // 接口 3: ipinfo.io
   try {
     const d = await fetchJson(`https://ipinfo.io/${ip}/json`);
     if (d.country) {
@@ -243,8 +246,13 @@ app.use((req, res, next) => {
 
 // ==================== 路由 ====================
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'read-receipt-tracker', platform: 'vercel+turso' });
+app.get('/health', async (req, res) => {
+  try {
+    await getDb();
+    res.json({ status: 'ok', service: 'read-receipt-tracker', platform: 'vercel+neon', db: 'connected' });
+  } catch(e) {
+    res.status(500).json({ status: 'error', message: e.message });
+  }
 });
 
 app.get('/login', (req, res) => {
@@ -281,10 +289,10 @@ app.post('/register', async (req, res) => {
     if (content.length > 50000) return res.status(400).json({ error: 'content too long' });
 
     const mid = generateMessageId(wx, content, ct);
-    await db.execute({
-      sql: 'INSERT OR IGNORE INTO messages(id,wx_id,content,create_time) VALUES(?,?,?,?)',
-      args: [mid, wx, content, ct],
-    });
+    await db.query(
+      'INSERT INTO messages(id,wx_id,content,create_time) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING',
+      [mid, wx, content, ct]
+    );
 
     const hostUrl = `${req.protocol}://${req.get('host')}/`;
     res.json({ success: true, id: mid, wxId: wx, pixel_url: `${hostUrl}pixel?wxId=${wx}&id=${mid}` });
@@ -297,15 +305,14 @@ app.get('/pixel', async (req, res) => {
 
   const ip = getClientIp(req), ua = (req.headers['user-agent']||'').slice(0,500);
 
-  // 异步写入，不阻塞响应
   lookupIpLocation(ip).then(async geo => {
     try {
       const db = await getDb();
       const c=geo?.country||'',r=geo?.region||'',ci=geo?.city||'',isp=geo?.isp||'',loc=geo?.loc||'';
-      await db.execute({
-        sql: 'INSERT OR IGNORE INTO reads(msg_id,wx_id,ip_address,user_agent,country,region,city,isp,loc,reader_wx_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
-        args: [mid,wx,ip,ua,c,r,ci,isp,loc,'未知访客'],
-      });
+      await db.query(
+        'INSERT INTO reads(msg_id,wx_id,ip_address,user_agent,country,region,city,isp,loc,reader_wx_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (msg_id, ip_address) DO NOTHING',
+        [mid,wx,ip,ua,c,r,ci,isp,loc,'未知访客']
+      );
     } catch(e) {}
   }).catch(()=>{});
 
@@ -320,10 +327,10 @@ app.get('/pixel.gif', async (req, res) => {
     try {
       const db = await getDb();
       const c=geo?.country||'',r=geo?.region||'',ci=geo?.city||'',isp=geo?.isp||'',loc=geo?.loc||'';
-      await db.execute({
-        sql: 'INSERT OR IGNORE INTO reads(msg_id,wx_id,ip_address,user_agent,country,region,city,isp,loc,reader_wx_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
-        args: ['pixel.gif','未知访客',ip,'wechat-image',c,r,ci,isp,loc,'未知访客'],
-      });
+      await db.query(
+        'INSERT INTO reads(msg_id,wx_id,ip_address,user_agent,country,region,city,isp,loc,reader_wx_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (msg_id, ip_address) DO NOTHING',
+        ['pixel.gif','未知访客',ip,'wechat-image',c,r,ci,isp,loc,'未知访客']
+      );
     } catch(e) {}
   }).catch(()=>{});
 
@@ -337,17 +344,17 @@ app.get('/count', async (req, res) => {
   if (!wx||!mid) return res.json({ count:0, error:'wxId and id required' });
 
   const db = await getDb();
-  const r = await db.execute({
-    sql: 'SELECT COUNT(DISTINCT ip_address) as cnt FROM reads WHERE msg_id=? AND wx_id=?',
-    args: [mid, wx],
-  });
-  const rows = await db.execute({
-    sql: 'SELECT * FROM reads WHERE msg_id=? AND wx_id=? ORDER BY read_at DESC, id DESC',
-    args: [mid, wx],
-  });
+  const r = await db.query(
+    'SELECT COUNT(DISTINCT ip_address) as cnt FROM reads WHERE msg_id=$1 AND wx_id=$2',
+    [mid, wx]
+  );
+  const rows = await db.query(
+    'SELECT * FROM reads WHERE msg_id=$1 AND wx_id=$2 ORDER BY read_at DESC, id DESC',
+    [mid, wx]
+  );
 
   res.json({
-    count: r.rows[0]?.cnt || 0, msg_id: mid,
+    count: parseInt(r.rows[0]?.cnt || 0), msg_id: mid,
     reads: rows.rows.map(x => ({
       ip_address: x.ip_address, reader_wx_id: x.reader_wx_id||'',
       location: [x.country,x.region,x.city].filter(Boolean).join(' ')||'-',
@@ -359,16 +366,16 @@ app.get('/count', async (req, res) => {
 
 app.get('/', requireAdmin, async (req, res) => {
   const db = await getDb();
-  const s = await db.execute(`
+  const s = await db.query(`
     SELECT
       (SELECT COUNT(*) FROM messages) as tm,
       (SELECT COUNT(DISTINCT ip_address) FROM reads) as tr,
       CASE WHEN (SELECT COUNT(*) FROM messages)=0 THEN 0.0
-           ELSE ROUND(CAST((SELECT COUNT(*) FROM reads) AS REAL)/(SELECT COUNT(*) FROM messages),1)
+           ELSE ROUND(CAST((SELECT COUNT(*) FROM reads) AS NUMERIC)/(SELECT COUNT(*) FROM messages),1)
       END as ar,
       (SELECT COUNT(DISTINCT ip_address) FROM reads WHERE country != '' OR city != '') as gr
   `);
-  const ms = await db.execute(`
+  const ms = await db.query(`
     SELECT m.*,
       (SELECT COUNT(DISTINCT ip_address) FROM reads r WHERE r.msg_id=m.id) as cnt,
       (SELECT COUNT(DISTINCT ip_address) FROM reads r WHERE r.msg_id=m.id AND (r.country!='' OR r.city!='')) as geo_cnt
@@ -376,6 +383,12 @@ app.get('/', requireAdmin, async (req, res) => {
   `);
 
   const stats = s.rows[0] || { tm:0, tr:0, ar:0, gr:0 };
+  // PostgreSQL 返回字符串，转数字
+  stats.tm = parseInt(stats.tm) || 0;
+  stats.tr = parseInt(stats.tr) || 0;
+  stats.ar = parseFloat(stats.ar) || 0;
+  stats.gr = parseInt(stats.gr) || 0;
+
   res.send(indexTemplate(stats, ms.rows));
 });
 
@@ -383,16 +396,16 @@ app.get('/message/:mid', requireAdmin, async (req, res) => {
   const mid = req.params.mid;
   const db = await getDb();
 
-  const m = await db.execute({
-    sql: 'SELECT m.*,(SELECT COUNT(DISTINCT ip_address) FROM reads r WHERE r.msg_id=m.id) as read_cnt FROM messages m WHERE m.id=?',
-    args: [mid],
-  });
+  const m = await db.query(
+    'SELECT m.*,(SELECT COUNT(DISTINCT ip_address) FROM reads r WHERE r.msg_id=m.id) as read_cnt FROM messages m WHERE m.id=$1',
+    [mid]
+  );
   if (!m.rows.length) return res.status(404).send('404');
 
-  const rs = await db.execute({
-    sql: 'SELECT wx_id,reader_wx_id,ip_address,user_agent,read_at,country,region,city,isp,loc FROM reads WHERE msg_id=? ORDER BY read_at DESC, id DESC',
-    args: [mid],
-  });
+  const rs = await db.query(
+    'SELECT wx_id,reader_wx_id,ip_address,user_agent,read_at,country,region,city,isp,loc FROM reads WHERE msg_id=$1 ORDER BY read_at DESC, id DESC',
+    [mid]
+  );
 
   if (req.query.json==='1') {
     const msg = m.rows[0];
@@ -411,13 +424,13 @@ app.get('/message/:mid', requireAdmin, async (req, res) => {
 app.get('/api/reads/:mid', async (req, res) => {
   const mid = req.params.mid;
   const db = await getDb();
-  const m = await db.execute({ sql: 'SELECT * FROM messages WHERE id=?', args: [mid] });
+  const m = await db.query('SELECT * FROM messages WHERE id=$1', [mid]);
   if (!m.rows.length) return res.status(404).json({ error:'not found' });
 
-  const rs = await db.execute({
-    sql: 'SELECT * FROM reads WHERE msg_id=? ORDER BY read_at DESC, id DESC',
-    args: [mid],
-  });
+  const rs = await db.query(
+    'SELECT * FROM reads WHERE msg_id=$1 ORDER BY read_at DESC, id DESC',
+    [mid]
+  );
 
   res.json({
     msg_id:mid, wxId:m.rows[0].wx_id, content:m.rows[0].content, read_count:rs.rows.length,
@@ -431,26 +444,26 @@ app.get('/api/reads/:mid', async (req, res) => {
 
 app.get('/api/messages', async (req, res) => {
   const db = await getDb();
-  const rows = await db.execute(`
+  const rows = await db.query(`
     SELECT m.*,(SELECT COUNT(DISTINCT ip_address) FROM reads r WHERE r.msg_id=m.id) as cnt
     FROM messages m ORDER BY registered_at DESC LIMIT 100
   `);
   res.json({ messages: rows.rows.map(r => ({
-    id:r.id, wxId:r.wx_id, content:r.content, read_count:r.cnt, registered_at:ts2date(r.registered_at),
+    id:r.id, wxId:r.wx_id, content:r.content, read_count:parseInt(r.cnt)||0, registered_at:ts2date(r.registered_at),
   })) });
 });
 
 app.post('/api/delete/:mid', requireAdmin, async (req, res) => {
   const db = await getDb();
-  await db.execute({ sql: 'DELETE FROM reads WHERE msg_id=?', args: [req.params.mid] });
-  await db.execute({ sql: 'DELETE FROM messages WHERE id=?', args: [req.params.mid] });
+  await db.query('DELETE FROM reads WHERE msg_id=$1', [req.params.mid]);
+  await db.query('DELETE FROM messages WHERE id=$1', [req.params.mid]);
   res.json({ success:true });
 });
 
 app.post('/api/delete-all', requireAdmin, async (req, res) => {
   const db = await getDb();
-  await db.execute('DELETE FROM reads');
-  await db.execute('DELETE FROM messages');
+  await db.query('DELETE FROM reads');
+  await db.query('DELETE FROM messages');
   res.json({ success:true });
 });
 
@@ -461,14 +474,14 @@ app.get('/batch-status', requireAdmin, async (req, res) => {
   if (!ids.length) return res.status(400).json({ error:'no valid ids' });
 
   const db = await getDb();
-  const ph = ids.map(()=>'?').join(',');
-  const rows = await db.execute({
-    sql: `SELECT msg_id, COUNT(DISTINCT ip_address) as cnt FROM reads WHERE msg_id IN (${ph}) GROUP BY msg_id`,
-    args: ids,
-  });
+  const placeholders = ids.map((_, i) => `$${i+1}`).join(',');
+  const rows = await db.query(
+    `SELECT msg_id, COUNT(DISTINCT ip_address) as cnt FROM reads WHERE msg_id IN (${placeholders}) GROUP BY msg_id`,
+    ids
+  );
 
   const rv = {};
-  rows.rows.forEach(r => rv[r.msg_id] = r.cnt);
+  rows.rows.forEach(r => rv[r.msg_id] = parseInt(r.cnt));
   ids.forEach(mid => { if(!(mid in rv)) rv[mid] = 0; });
   res.json({ statuses:rv });
 });
